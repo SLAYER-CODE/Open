@@ -1,0 +1,758 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+error_handler() {
+    local rc=$?
+    if [[ $rc -ne 0 ]]; then
+        echo "openfzf: error (exit ${rc})" >&2
+    fi
+}
+trap error_handler EXIT
+
+DB="${HOME}/.local/share/opencode/opencode.db"
+CACHE_DIR="${HOME}/.cache/openfzf"
+OPENED_DB="${CACHE_DIR}/opened.db"
+SPACES_FILE="${HOME}/.config/vpns/spaces"
+VPN_DIR="${HOME}/Downloads/VPNS"
+VETH_HOST="veth-host"
+VETH_NS="veth-vpn"
+HOST_IP="10.200.1.1/24"
+NS_IP="10.200.1.2/24"
+DNS_SERVER="1.1.1.1"
+OPENCODE_PORT=4096
+SHOW_ALL_FORKS="${OPENFZF_ALL:-}"
+DEBUG="${OPENFZF_DEBUG:-}"
+DBGLOG="${OPENFZF_LOG:-}"
+
+if [[ -t 1 ]]; then
+    RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'
+    BLUE='\033[34m'; MAGENTA='\033[35m'; CYAN='\033[36m'
+    BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; BOLD=''; DIM=''; NC=''
+fi
+
+agent_color() {
+    case "$1" in plan) echo "$BLUE" ;; build) echo "$GREEN" ;; create) echo "$GREEN" ;; explore) echo "$YELLOW" ;; general|"") echo "$CYAN" ;; *) echo "$NC"  ;; esac
+}
+
+VPN_ACTIVE=""
+if [[ -f "$SPACES_FILE" ]]; then
+    while IFS='|' read -r name _; do
+        pid_file="/tmp/opencode-serve-${name}.pid"
+        if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+            VPN_ACTIVE="$name"
+            break
+        fi
+    done < "$SPACES_FILE"
+fi
+
+# Detect original user (for sudo namespace execution)
+ORIG_USER="${SUDO_USER:-$USER}"
+
+# === Space selector (VPN namespaces) ===
+select_space() {
+    while true; do
+        local entries=()
+        local spaces=()
+        if [[ -f "$SPACES_FILE" ]]; then
+            while IFS='|' read -r name _ _ _; do
+                [[ -n "$name" ]] && spaces+=("$name")
+            done < "$SPACES_FILE"
+        fi
+
+        entries+=("Local|  Local")
+
+        local s running
+        for s in "${spaces[@]}"; do
+            if sudo -n ip netns list 2>/dev/null | grep -qw "$s"; then
+                running=true
+            else
+                running=false
+            fi
+            if [[ "$running" == "true" ]]; then
+                if sudo -n ip netns exec "$s" ip addr show tun0 &>/dev/null 2>/dev/null; then
+                    entries+=("$s|  ● ${s}")
+                else
+                    entries+=("$s|  ○ ${s}")
+                fi
+            else
+                entries+=("$s|${DIM}  ○ ${s}${NC}")
+            fi
+        done
+
+        entries+=("__NEW_VPN__|  Crear New VPN")
+
+        local selected
+        selected=$(printf '%s\n' "${entries[@]}" | fzf --ansi --delimiter='|' --with-nth=2.. \
+            --header="${DIM}Seleccionar espacio VPN | Enter=aceptar | Esc=cancelar${NC}" \
+            --reverse --cycle) || { echo "Local"; return; }
+        [[ -z "$selected" ]] && { echo "Local"; return; }
+
+        local space
+        space=$(cut -d'|' -f1 <<< "$selected")
+
+        [[ "$selected" == *"${DIM}"* ]] && continue
+
+        if [[ "$space" == "__NEW_VPN__" ]]; then
+            create_new_vpn || true
+            continue
+        fi
+
+        echo "$space"
+        return
+    done
+}
+
+# === VPN creation helpers (ported from vpns) ===
+ns_pid_file() { echo "/tmp/openvpn-$1.pid"; }
+ns_log_file() { echo "/tmp/openvpn-$1.log"; }
+ns_socat_host_pid() { echo "/tmp/socat-host-$1.pid"; }
+ns_socat_ns_pid() { echo "/tmp/socat-ns-$1.pid"; }
+ns_opencode_serve_pid() { echo "/tmp/opencode-serve-$1.pid"; }
+ns_socat_opencode_pid() { echo "/tmp/socat-opencode-$1.pid"; }
+
+get_iface() { ip route | awk '/default/ {print $5; exit}'; }
+
+ns_is_running() { sudo -n ip netns list 2>/dev/null | grep -qw "$1"; }
+
+ns_vpn_connected() { sudo -n ip netns exec "$1" ip addr show tun0 &>/dev/null 2>/dev/null; }
+
+has_socat() { command -v socat &>/dev/null; }
+
+ns_cleanup() {
+    local ns="$1" pid f
+    echo "[+] Deteniendo OpenVPN..." >&2
+    pid=$(ns_pid_file "$ns")
+    if [[ -f "$pid" ]]; then
+        sudo kill "$(cat "$pid")" 2>/dev/null || true
+        sudo rm -f "$pid"
+    fi
+    echo "[+] Deteniendo ADB forwarders..." >&2
+    for f in "$(ns_socat_host_pid "$ns")" "$(ns_socat_ns_pid "$ns")"; do
+        if [[ -f "$f" ]]; then
+            sudo kill "$(cat "$f")" 2>/dev/null || true
+            sudo rm -f "$f"
+        fi
+    done
+    echo "[+] Deteniendo OpenCode serve..." >&2
+    f=$(ns_opencode_serve_pid "$ns")
+    if [[ -f "$f" ]]; then
+        sudo kill "$(cat "$f")" 2>/dev/null || true
+        sudo rm -f "$f"
+    fi
+    echo "[+] Deteniendo forwarder OpenCode..." >&2
+    f=$(ns_socat_opencode_pid "$ns")
+    if [[ -f "$f" ]]; then
+        sudo kill "$(cat "$f")" 2>/dev/null || true
+        sudo rm -f "$f"
+    fi
+    echo "[+] Eliminando namespace..." >&2
+    sudo ip netns delete "$ns" 2>/dev/null || true
+    echo "[+] Eliminando veth..." >&2
+    sudo ip link delete "$VETH_HOST" 2>/dev/null || true
+}
+
+auto_name() {
+    local config_name="$1" base final suffix=1
+    base=$(basename "$config_name" .ovpn | LC_ALL=C sed 's/[^_a-zA-Z0-9-]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
+    [[ -z "$base" ]] && base="space"
+    final="$base"
+    while grep -q "^$final|" "$SPACES_FILE" 2>/dev/null; do
+        final="${base}-${suffix}"
+        ((suffix++))
+    done
+    echo "$final"
+}
+
+save_space() {
+    local ns="$1" config="$2" ip="$3" ts
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%S")
+    grep -v "^$ns|" "$SPACES_FILE" 2>/dev/null > "${SPACES_FILE}.tmp" || true
+    echo "$ns|$config|$ip|$ts" >> "${SPACES_FILE}.tmp"
+    mv "${SPACES_FILE}.tmp" "$SPACES_FILE"
+}
+
+select_ovpn() {
+    declare -A map
+    local ns cfg ip ts f b
+    while IFS='|' read -r ns cfg ip ts; do
+        map["$cfg"]="$ns|$ip|$ts"
+    done < "$SPACES_FILE" || true
+
+    local lines=()
+
+    while IFS= read -r f; do
+        b=$(basename "$f")
+        [[ -z "${map[$b]:-}" ]] && lines+=("$b")
+    done < <(ls -1tr "$VPN_DIR"/*.ovpn 2>/dev/null || true) || true
+
+    while IFS='|' read -r ns cfg ip ts; do
+        [[ ! -f "$VPN_DIR/$cfg" ]] && continue
+        local txt col
+        if ns_is_running "$ns" 2>/dev/null && ns_vpn_connected "$ns" 2>/dev/null; then
+            col="$GREEN"
+            [[ -z "$ip" || "$ip" == "offline" ]] && txt="Connected" || txt="$ip"
+        else
+            col="$RED"
+            txt="offline"
+        fi
+        lines+=("${cfg} → ${col}● ${txt}${NC}")
+    done < "$SPACES_FILE" || true
+
+    if [[ ${#lines[@]} -eq 0 ]]; then
+        echo "No hay archivos .ovpn en $VPN_DIR" >&2
+        return 1
+    fi
+    if [[ ${#lines[@]} -eq 1 ]]; then
+        echo "${lines[0]%% →*}"
+        return 0
+    fi
+
+    local sel
+    sel=$(printf '%s\n' "${lines[@]}" | fzf --ansi --tac --prompt='Select VPN > ' --height=~40%) || return 1
+    echo "${sel%% →*}"
+}
+
+ns_start() {
+    local ns="$1" config="$2" inet_iface i vpn_ip
+
+    if [[ ! -f "$config" ]]; then
+        echo "[!] Archivo VPN no encontrado: $config" >&2
+        return 1
+    fi
+
+    inet_iface=$(get_iface) || {
+        echo "[!] No se pudo detectar interfaz principal" >&2
+        return 1
+    }
+    echo "[+] Interfaz principal: $inet_iface" >&2
+
+    ns_cleanup "$ns"
+
+    echo "[+] Creando namespace..." >&2
+    sudo ip netns add "$ns" || return 1
+    sudo ip netns exec "$ns" ip link set lo up || return 1
+
+    echo "[+] Creando veth pair..." >&2
+    sudo ip link add "$VETH_HOST" type veth peer name "$VETH_NS" || return 1
+    sudo ip link set "$VETH_NS" netns "$ns" || return 1
+
+    echo "[+] Configurando host..." >&2
+    sudo ip addr add "$HOST_IP" dev "$VETH_HOST" || return 1
+    sudo ip link set "$VETH_HOST" up || return 1
+
+    echo "[+] Configurando namespace..." >&2
+    sudo ip netns exec "$ns" ip addr add "$NS_IP" dev "$VETH_NS" || return 1
+    sudo ip netns exec "$ns" ip link set "$VETH_NS" up || return 1
+    sudo ip netns exec "$ns" ip route add default via 10.200.1.1 || return 1
+
+    echo "[+] Configurando DNS..." >&2
+    sudo mkdir -p "/etc/netns/$ns" || return 1
+    echo "nameserver $DNS_SERVER" | sudo tee "/etc/netns/$ns/resolv.conf" >/dev/null || return 1
+
+    echo "[+] Activando forwarding..." >&2
+    sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null || return 1
+
+    echo "[+] Configurando NAT..." >&2
+    sudo iptables -t nat -C POSTROUTING -s 10.200.1.0/24 -o "$inet_iface" -j MASQUERADE 2>/dev/null || \
+    sudo iptables -t nat -A POSTROUTING -s 10.200.1.0/24 -o "$inet_iface" -j MASQUERADE || return 1
+
+    echo "[+] Verificando conectividad..." >&2
+    sudo ip netns exec "$ns" ping -c 1 1.1.1.1 >/dev/null 2>&1 || true
+
+    if has_socat; then
+        echo "[+] Iniciando ADB forwarders..." >&2
+        sudo socat TCP-LISTEN:5037,bind=10.200.1.1,fork,reuseaddr TCP:127.0.0.1:5037 >/dev/null 2>&1 &
+        echo $! | sudo tee "$(ns_socat_host_pid "$ns")" >/dev/null
+        sudo ip netns exec "$ns" socat TCP-LISTEN:5037,bind=127.0.0.1,fork,reuseaddr TCP:10.200.1.1:5037 >/dev/null 2>&1 &
+        echo $! | sudo tee "$(ns_socat_ns_pid "$ns")" >/dev/null
+    fi
+
+    echo "[+] Iniciando OpenVPN..." >&2
+    sudo ip netns exec "$ns" openvpn \
+        --config "$config" \
+        --daemon \
+        --resolv-retry infinite \
+        --log "$(ns_log_file "$ns")" \
+        --writepid "$(ns_pid_file "$ns")" >/dev/null 2>&1 || return 1
+
+    echo "[+] Esperando tun0..." >&2
+    for i in {1..20}; do
+        if ns_vpn_connected "$ns"; then
+            break
+        fi
+        sleep 1
+    done
+
+    if ! ns_vpn_connected "$ns"; then
+        echo "[!] VPN no conectó" >&2
+        echo >&2
+        sudo cat "$(ns_log_file "$ns")" >&2 || true
+        ns_cleanup "$ns"
+        return 1
+    fi
+
+    vpn_ip=$(sudo ip netns exec "$ns" curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "")
+    if [[ ! "$vpn_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        vpn_ip="offline"
+    fi
+
+    save_space "$ns" "$(basename "$config")" "$vpn_ip"
+
+    echo >&2
+    echo "==================================" >&2
+    echo " Namespace : $ns" >&2
+    echo " VPN IP    : $vpn_ip" >&2
+    echo "==================================" >&2
+    echo >&2
+}
+
+create_new_vpn() {
+    local ovpn ovpn_path ns_name
+    echo >&2
+    echo "━━━ Crear Nueva VPN ━━━" >&2
+    echo >&2
+
+    ovpn=$(select_ovpn) || {
+        echo "[!] No se seleccionó ninguna VPN" >&2
+        return 1
+    }
+
+    ovpn_path="$VPN_DIR/$ovpn"
+    if [[ ! -f "$ovpn_path" ]]; then
+        ovpn_path="$ovpn"
+    fi
+    echo "[+] VPN seleccionada: $(basename "$ovpn_path")" >&2
+
+    ns_name=$(auto_name "$(basename "$ovpn_path")")
+    echo "[+] Creando espacio: $ns_name" >&2
+
+    ns_start "$ns_name" "$ovpn_path"
+}
+
+# Parse arguments
+NO_VPN=false
+AGENT_FLAGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --all)                AGENT_FLAGS=("ALL") ;;
+        --plan)               AGENT_FLAGS+=("plan") ;;
+        --build)              AGENT_FLAGS+=("build") ;;
+        --explore|--explorer) AGENT_FLAGS+=("explore") ;;
+        --general)            AGENT_FLAGS+=("general") ;;
+        --no-vpn)             NO_VPN=true ;;
+    esac
+done
+
+# Build SQL agent filter clauses
+AGENT_WHERE=""   # for queries without existing WHERE
+AGENT_AND=""     # for queries with existing WHERE
+if [[ ${#AGENT_FLAGS[@]} -eq 0 ]]; then
+    AGENT_WHERE="WHERE agent IN ('build', 'plan')"
+    AGENT_AND="AND agent IN ('build', 'plan')"
+elif [[ " ${AGENT_FLAGS[*]} " != *" ALL "* ]]; then
+    quoted=$(printf "'%s'," "${AGENT_FLAGS[@]}")
+    quoted="${quoted%,}"
+    AGENT_WHERE="WHERE agent IN ($quoted)"
+    AGENT_AND="AND agent IN ($quoted)"
+fi
+
+# === Init opened cache ===
+mkdir -p "$CACHE_DIR"
+sqlite3 "$OPENED_DB" "CREATE TABLE IF NOT EXISTS opened (id TEXT PRIMARY KEY, last_opened INTEGER);" 2>/dev/null || true
+
+# Adaptive column widths based on terminal size
+
+# Adaptive column widths based on terminal size
+setup_widths() {
+    local cols
+    cols=$(tput cols 2>/dev/null || echo "${COLUMNS:-80}")
+    TITLE_W=30
+    DIR_W=$((cols - TITLE_W - 7 - 10 - 3 - 4))
+    if [[ $DIR_W -lt 10 ]]; then
+        DIR_W=10
+        TITLE_W=$((cols - DIR_W - 7 - 10 - 3 - 4))
+        [[ $TITLE_W -lt 15 ]] && TITLE_W=15
+    fi
+    :
+}
+setup_widths
+
+if [[ -n "$DEBUG" ]]; then
+    dbg_count=$(sqlite3 "$DB" "SELECT COUNT(*) FROM session;" 2>&1) || dbg_count="ERROR"
+    dbg_groups=$(sqlite3 "$DB" "SELECT COUNT(DISTINCT title) FROM session;" 2>&1) || dbg_groups="ERROR"
+    echo "DEBUG: cols=$(tput cols) TITLE_W=$TITLE_W DIR_W=$DIR_W VPN=$VPN_ACTIVE sessions=$dbg_count groups=$dbg_groups" >&2
+fi
+
+abbrev_dir() {
+    local dir="$1" max="$2" home="$HOME"
+    [[ -z "$max" ]] && max=22
+    if [[ "$dir" == "$home" ]]; then echo "~"; return; fi
+    local rel
+    if [[ "$dir" == "$home/"* ]]; then rel="${dir#$home/}"
+    else rel="${dir#/}"; fi
+    IFS='/' read -ra parts <<< "$rel"
+    local n=${#parts[@]}
+    [[ $max -lt 4 ]] && max=4
+    if (( n == 1 )); then echo "${parts[0]:0:$max}"; return; fi
+    local last="${parts[$((n-1))]}"
+    local llen=${#last}
+    # Full relative path fits
+    local full
+    printf -v full "/%s" "${parts[@]}"
+    full="${full:1}"
+    (( ${#full} <= max )) && { echo "$full"; return; }
+    # Very tight → ../last (truncated if needed)
+    (( max < llen + 4 )) && { echo "../${last:0:$((max-3))}"; return; }
+    # Compress middle components to first letter, keep first and last full
+    local first="${parts[0]}"
+    local mid_count=$((n - 2))
+    local compressed=$(( ${#first} + mid_count + llen + n - 1 ))
+    if (( compressed <= max )); then
+        local out="$first"
+        for (( i=1; i<n-1; i++ )); do
+            out+="/${parts[$i]:0:1}"
+        done
+        out+="/$last"
+        echo "$out"
+    else
+        echo "../$last"
+    fi
+}
+
+fmt_date() {
+    local epoch_s="$1"
+    date -d "@$epoch_s" '+%m/%d %H:%M' 2>/dev/null || date -r "$epoch_s" '+%m/%d %H:%M' 2>/dev/null || echo "?"
+}
+
+fmt_date_secs() {
+    local epoch_s="$1"
+    date -d "@$epoch_s" '+%m/%d %H:%M:%S' 2>/dev/null || date -r "$epoch_s" '+%m/%d %H:%M:%S' 2>/dev/null || echo "?"
+}
+
+# Color by recency: green <2d, yellow <7d, red >7d
+date_color() {
+    local epoch_s="$1" now
+    now=$(date +%s)
+    local days=$(( (now - epoch_s) / 86400 ))
+    if [[ $days -lt 2 ]]; then
+        echo "$GREEN"
+    elif [[ $days -lt 7 ]]; then
+        echo "$YELLOW"
+    else
+        echo "$RED"
+    fi
+}
+
+# Strip "(fork #N)" suffix for canonical grouping
+canonical_title() {
+    local t="$1"
+    if [[ "$t" =~ \ \(fork\ #[0-9]+\)$ ]]; then
+        local suffix="${BASH_REMATCH[0]}"
+        echo "${t:0: -${#suffix}}"
+    else
+        echo "$t"
+    fi
+}
+
+# === Build level-1 entries (deduplicated by title) ===
+build_l1() {
+    mapfile -t lines < <(sqlite3 "$DB" "
+ATTACH DATABASE '${OPENED_DB}' AS o;
+SELECT MAX(session.id),
+       CASE WHEN title REGEXP ' \(fork #[0-9]+\)$'
+            THEN SUBSTR(title, 1, INSTR(title, ' (fork #') - 1)
+            ELSE title
+       END,
+       COALESCE(NULLIF(MAX(agent),''),'general'),
+       MAX(directory),
+       MAX(time_updated),
+       MAX(time_created),
+       COUNT(*)
+ FROM session LEFT JOIN o.opened ON session.id = o.opened.id
+ ${AGENT_WHERE}
+ GROUP BY 2
+ORDER BY COALESCE(NULLIF(MAX(o.opened.last_opened), 0), MAX(time_updated)) DESC;
+    " 2>/dev/null) || return 1
+
+    [[ ${#lines[@]} -eq 0 ]] && return 1
+
+    local entries=()
+    local line id title agent dir epoch_up epoch_cr forks
+    for line in "${lines[@]}"; do
+        IFS='|' read -r id title agent dir epoch_up epoch_cr forks <<< "$line"
+        [[ -z "$id" || -z "$title" ]] && continue
+        local agent_col abbrev created short_id vpn_tag vpn_col fork_str
+        agent_col=$(agent_color "$agent")
+        abbrev=$(abbrev_dir "$dir" "$DIR_W")
+        created=$(fmt_date "$((epoch_up/1000))")
+        dcol=$(date_color "$((epoch_up/1000))")
+        short_id="${id:0:14}"
+        vpn_tag=" -"
+        vpn_col="$DIM"
+        [[ -n "$VPN_ACTIVE" ]] && { vpn_tag="VPN"; vpn_col="$GREEN"; }
+        [[ ${#title} -gt $TITLE_W ]] && title="${title:0:$((TITLE_W-3))}..."
+        if (( forks > 1 )); then
+            fork_str="x${forks}"
+        else
+            fork_str=""
+        fi
+        entries+=("$(printf '%s\t%b%-*s%b %b%-*s%b %b%-*s%b %-*s %b%-*s%b %s' \
+            "$id" \
+            "$BOLD" "$TITLE_W" "$title" "$NC" \
+            "$agent_col" "7" "$agent" "$NC" \
+            "$dcol" "10" "$created" "$NC" \
+            "$DIR_W" "$abbrev" \
+            "$vpn_col" "3" "$vpn_tag" "$NC" \
+            "$fork_str")")
+    done
+
+    # Prepend "New Session" entry
+    local now_epoch now_date new_entry
+    now_epoch=$(date +%s)
+    now_date=$(fmt_date "$now_epoch")
+    new_entry=$(printf '%s\t%b%-*s%b %b%-*s%b %b%-*s%b %-*s %b%-*s%b %s' \
+        '__NEW_SESSION__' \
+        "$BOLD$GREEN" "$TITLE_W" " + New Session" "$NC" \
+        "$GREEN" "7" "create" "$NC" \
+        "$GREEN" "10" "$now_date" "$NC" \
+        "$DIR_W" "-" \
+        "$DIM" "3" " -" "$NC" \
+        "")
+    entries=("$new_entry" "${entries[@]}")
+
+    local header
+    local ses_count=$(( ${#entries[@]} - 1 ))
+    header=$(printf "${DIM}%d sesiones | + New Session (1era) | Enter=abrir | Ctrl+E=expandir forks${NC}" "$ses_count")
+
+    if [[ ${#entries[@]} -eq 0 ]]; then
+        echo "No sessions to display" >&2
+        return 1
+    fi
+    local fzf_out
+    fzf_out=$(printf '%s\n' "${entries[@]}" | fzf --ansi \
+        --with-nth=2.. --delimiter=$'\t' \
+        --header-first --header="$header" \
+        --prompt="openfzf > " \
+        --expect=ctrl-e,enter \
+        --reverse --cycle) || true
+    if [[ -n "$DEBUG" || -n "$DBGLOG" ]]; then
+        local logline="build_l1: fzf_out='$(head -2 <<< "$fzf_out" | tr '\n' '|')'"
+        if [[ -n "$DEBUG" ]]; then echo "$logline" >&2; fi
+        if [[ -n "$DBGLOG" ]]; then echo "$logline" >> "$DBGLOG"; fi
+    fi
+    printf '%s\n' "$fzf_out"
+}
+
+# === Build level-2 entries (forks of a specific title) ===
+gen_l2_entries() {
+    local target_title="$1"
+    local cols
+    cols=$(tput cols 2>/dev/null || echo "${COLUMNS:-80}")
+    local tw=25
+    local aw=7
+    local dw=$((cols - tw - aw - 15 - 4))
+    if [[ $dw -lt 10 ]]; then
+        dw=10
+        tw=$((cols - dw - aw - 15 - 4))
+        [[ $tw -lt 15 ]] && tw=15
+    fi
+    if [[ -n "$DEBUG" ]]; then echo "L2: cols=$cols tw=$tw dw=$dw" >&2; fi
+
+    local escaped
+    escaped=$(printf '%s' "$target_title" | sed "s/'/''/g; s/%/\\%/g; s/_/\\_/g")
+
+    mapfile -t lines < <(sqlite3 "$DB" "
+ATTACH DATABASE '${OPENED_DB}' AS o;
+SELECT session.id, title, COALESCE(NULLIF(agent,''),'general'), directory, time_updated, time_created
+ FROM session LEFT JOIN o.opened ON session.id = o.opened.id
+ WHERE title LIKE '${escaped}%' ESCAPE '\'
+ ${AGENT_AND}
+ ORDER BY COALESCE(NULLIF(o.opened.last_opened, 0), time_updated) DESC;
+    " 2>/dev/null) || return 1
+
+    [[ ${#lines[@]} -eq 0 ]] && return 1
+
+    local line id title agent dir epoch_up epoch_cr
+    for line in "${lines[@]}"; do
+        IFS='|' read -r id title agent dir epoch_up epoch_cr <<< "$line"
+        [[ -z "$id" ]] && continue
+        local agent_col abbrev created_full
+        agent_col=$(agent_color "$agent")
+        abbrev=$(abbrev_dir "$dir" "$dw")
+        created_full=$(fmt_date_secs "$((epoch_up/1000))")
+        dcol=$(date_color "$((epoch_up/1000))")
+        [[ ${#title} -gt $tw ]] && title="${title:0:$((tw-3))}..."
+        printf '%s\t%b%-*s%b %b%-*s%b %b%s%b %-*s\n' \
+            "$id" \
+            "$BOLD" "$tw" "$title" "$NC" \
+            "$agent_col" "7" "$agent" "$NC" \
+            "$dcol" "$created_full" "$NC" \
+            "$dw" "$abbrev"
+    done
+}
+
+build_l2() {
+    local target_title="$1"
+    local count
+    count=$(sqlite3 "$DB" "SELECT COUNT(*) FROM session WHERE title LIKE '$(printf '%s' "$(canonical_title "$target_title")" | sed "s/'/''/g; s/%/\\%/g; s/_/\\_/g")%' ESCAPE '\' ${AGENT_AND};")
+    local header
+    header=$(printf "${DIM}%d forks de \"%s\" | Enter=abrir | Esc=volver${NC}" "$count" "$target_title")
+
+    gen_l2_entries "$target_title" | fzf --ansi \
+        --with-nth=2.. --delimiter=$'\t' \
+        --header-first --header="$header" \
+        --prompt="fork > " \
+        --reverse --cycle || true
+}
+
+open_session() {
+    local sid="$1" space="${2:-Local}"
+    sqlite3 "$OPENED_DB" "INSERT OR REPLACE INTO opened VALUES ('$sid', strftime('%s','now') * 1000);"
+
+    if [[ "$space" == "Local" ]]; then
+        local cmd="opencode --session \"$sid\""
+        if command -v kitty &>/dev/null; then
+            kitty @ launch --type=tab --title "opencode:${sid:0:12}" --hold \
+                bash -c "$cmd" 2>/dev/null || \
+            kitty --hold bash -c "$cmd" &>/dev/null & disown
+        else
+            echo "Session ID: $sid"
+            echo "Run: opencode --session $sid"
+        fi
+    else
+        if command -v kitty &>/dev/null; then
+            kitty --hold bash -c "sudo ip netns exec \"$space\" runuser -u \"$ORIG_USER\" -- opencode --session \"$sid\"" &>/dev/null & disown
+        else
+            echo "sudo ip netns exec $space runuser -u $ORIG_USER -- opencode --session $sid"
+        fi
+    fi
+}
+
+new_session() {
+    local space="${1:-Local}"
+
+    if [[ "$space" == "Local" ]]; then
+        if command -v kitty &>/dev/null; then
+            kitty @ launch --type=tab --title "opencode:new" --hold \
+                bash -c "opencode" 2>/dev/null || \
+            kitty --hold bash -c "opencode" &>/dev/null & disown
+        else
+            echo "Run: opencode"
+        fi
+    else
+        if command -v kitty &>/dev/null; then
+            kitty --hold bash -c "sudo ip netns exec \"$space\" runuser -u \"$ORIG_USER\" -- opencode" &>/dev/null & disown
+        else
+            echo "sudo ip netns exec $space runuser -u $ORIG_USER -- opencode"
+        fi
+    fi
+}
+
+# === Entry point ===
+if [[ -n "$SHOW_ALL_FORKS" ]]; then
+    cols=$(tput cols 2>/dev/null || echo "${COLUMNS:-80}")
+    fmt_tw=30
+    fmt_dw=$((cols - fmt_tw - 7 - 10 - 3 - 4))
+    if [[ $fmt_dw -lt 10 ]]; then
+        fmt_dw=10
+        fmt_tw=$((cols - fmt_dw - 7 - 10 - 3 - 4))
+        [[ $fmt_tw -lt 15 ]] && fmt_tw=15
+    fi
+
+    # Skip dedup, show all sessions (for EXPANDED view by default)
+    mapfile -t lines < <(sqlite3 "$DB" "
+ATTACH DATABASE '${OPENED_DB}' AS o;
+SELECT session.id, title, COALESCE(NULLIF(agent,''),'general'), directory, time_updated, time_created
+FROM session LEFT JOIN o.opened ON session.id = o.opened.id
+${AGENT_WHERE}
+ORDER BY COALESCE(NULLIF(o.opened.last_opened, 0), time_updated) DESC;
+    " 2>/dev/null) || { echo "Error: DB error" >&2; exit 1; }
+    [[ ${#lines[@]} -eq 0 ]] && { echo "No sessions."; exit 1; }
+
+    entries=()
+    for line in "${lines[@]}"; do
+        IFS='|' read -r id title agent dir epoch_up epoch_cr <<< "$line"
+        [[ -z "$id" || -z "$title" ]] && continue
+        agent_col=$(agent_color "$agent")
+        abbrev=$(abbrev_dir "$dir" "$fmt_dw")
+        created=$(fmt_date "$((epoch_up/1000))")
+        dcol=$(date_color "$((epoch_up/1000))")
+        short_id="${id:0:14}"
+        vpn_tag=" -"; vpn_col="$DIM"
+        [[ -n "$VPN_ACTIVE" ]] && { vpn_tag="VPN"; vpn_col="$GREEN"; }
+        [[ ${#title} -gt $fmt_tw ]] && title="${title:0:$((fmt_tw-3))}..."
+        entries+=("$(printf '%s\t%b%-*s%b %b%-*s%b %b%-*s%b %-*s %b%-*s%b' \
+            "$id" \
+            "$BOLD" "$fmt_tw" "$title" "$NC" \
+            "$agent_col" "7" "$agent" "$NC" \
+            "$dcol" "10" "$created" "$NC" \
+            "$fmt_dw" "$abbrev" \
+            "$vpn_col" "3" "$vpn_tag" "$NC")")
+    done
+
+    header=$(printf "${DIM}%d sesiones | Enter=abrir${NC}" "${#entries[@]}")
+
+    selected=$(printf '%s\n' "${entries[@]}" | fzf --ansi \
+        --with-nth=2.. --delimiter=$'\t' \
+        --header-first --header="$header" \
+        --prompt="openfzf > " \
+        --reverse --cycle) || true
+    [[ -z "$selected" ]] && exit 0
+    if [[ "$NO_VPN" == "true" ]]; then
+        space="Local"
+    else
+        space=$(select_space)
+    fi
+    open_session "$(cut -f1 <<< "$selected")" "$space"
+    exit 0
+fi
+
+# === Normal flow: Level 1 → Level 2 (loop) ===
+log() { local m="$1"; if [[ -n "$DEBUG" ]]; then echo "$m" >&2; fi; if [[ -n "$DBGLOG" ]]; then echo "$m" >> "$DBGLOG"; fi; }
+
+while true; do
+    l1_out=$(build_l1) || true
+    [[ -z "$l1_out" ]] && exit 0
+
+    l1_key=$(head -1 <<< "$l1_out")
+    l1_sel=$(tail -n +2 <<< "$l1_out" | head -1)
+    [[ -z "$l1_sel" ]] && exit 0
+
+    l1_id=$(cut -f1 <<< "$l1_sel")
+
+    if [[ "$l1_id" == "__NEW_SESSION__" ]]; then
+        if [[ "$NO_VPN" == "true" ]]; then space="Local"; else space=$(select_space); fi
+        new_session "$space"
+        continue
+    fi
+
+    # Look up title and fork count
+    escaped_id=$(printf '%s' "$l1_id" | sed "s/'/''/g")
+    raw_title=$(sqlite3 "$DB" "SELECT title FROM session WHERE id = '$escaped_id' LIMIT 1;" || echo "")
+
+    fork_count=0; canonical=""
+    if [[ -n "$raw_title" ]]; then
+        canonical=$(canonical_title "$raw_title")
+        ec=$(printf '%s' "$canonical" | sed "s/'/''/g; s/%/\\%/g; s/_/\\_/g")
+        fork_count=$(sqlite3 "$DB" "SELECT COUNT(*) FROM session WHERE title LIKE '${ec}%' ESCAPE '\';")
+    fi
+
+    log "l1_key='$l1_key' l1_id='$l1_id' raw_title='$raw_title' canonical='$canonical' fork_count='$fork_count'"
+
+    if [[ -z "$canonical" ]] || (( fork_count <= 1 )); then
+        log "no forks, opening session directly"
+        if [[ "$NO_VPN" == "true" ]]; then space="Local"; else space=$(select_space); fi
+        open_session "$l1_id" "$space"
+        continue
+    fi
+
+    log "showing level 2 for '$canonical'"
+    l2_out=$(build_l2 "$canonical") || true
+    log "l2_out='${l2_out:0:60}...'"
+    [[ -z "$l2_out" ]] && continue  # Escape → back to level 1
+    if [[ "$NO_VPN" == "true" ]]; then space="Local"; else space=$(select_space); fi
+    open_session "$(cut -f1 <<< "$l2_out")" "$space"
+    continue
+done

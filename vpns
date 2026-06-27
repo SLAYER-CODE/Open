@@ -1,0 +1,756 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# === Configuration ===
+CONFIG_DIR="${HOME}/.config/vpns"
+SPACES_FILE="${CONFIG_DIR}/spaces"
+VPN_DIR="${HOME}/Downloads/VPNS"
+VETH_HOST="veth-host"
+VETH_NS="veth-vpn"
+HOST_IP="10.200.1.1/24"
+NS_IP="10.200.1.2/24"
+DNS_SERVER="1.1.1.1"
+OPENCODE_PORT=4096
+
+# Top-level variables (used in case branches, not inside functions)
+ns=""
+port=""
+cmd_ns=""
+
+# Colors (disable if not a terminal)
+if [[ -t 1 ]]; then
+    RED='\033[31m'
+    GREEN='\033[32m'
+    YELLOW='\033[33m'
+    BOLD='\033[1m'
+    NC='\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BOLD=''
+    NC=''
+fi
+
+# Colored output helpers
+log() { printf "${GREEN}[+]${NC} %s\n" "$*"; }
+err() { printf "${RED}[!]${NC} %s\n" "$*"; }
+warn() { printf "${YELLOW}[!]${NC} %s\n" "$*"; }
+hdr() { printf "${BOLD}%s${NC}\n" "$*"; }
+
+mkdir -p "$CONFIG_DIR"
+[[ -f "$SPACES_FILE" ]] || touch "$SPACES_FILE"
+
+detect_original_user() {
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        ORIG_USER="$SUDO_USER"
+    else
+        ORIG_USER="$USER"
+    fi
+    ORIG_UID=$(id -u "$ORIG_USER")
+    ORIG_GID=$(id -g "$ORIG_USER")
+}
+detect_original_user
+
+# === Space management ===
+list_spaces() {
+    [[ -s "$SPACES_FILE" ]] && cat "$SPACES_FILE"
+}
+
+save_space() {
+    local ns="$1" config="$2" ip="$3"
+    local ts
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%S")
+    grep -v "^$ns|" "$SPACES_FILE" 2>/dev/null > "${SPACES_FILE}.tmp" || true
+    echo "$ns|$config|$ip|$ts" >> "${SPACES_FILE}.tmp"
+    mv "${SPACES_FILE}.tmp" "$SPACES_FILE"
+}
+
+remove_space() {
+    local ns="$1"
+    grep -v "^$ns|" "$SPACES_FILE" 2>/dev/null > "${SPACES_FILE}.tmp" || true
+    mv "${SPACES_FILE}.tmp" "$SPACES_FILE"
+}
+
+get_space_ip() {
+    grep "^$1|" "$SPACES_FILE" 2>/dev/null | cut -d'|' -f3 || echo ""
+}
+
+get_space_config() {
+    grep "^$1|" "$SPACES_FILE" 2>/dev/null | cut -d'|' -f2 || echo ""
+}
+
+set_last_ns() {
+    echo "$1" > "${CONFIG_DIR}/last"
+}
+
+# === Namespace helpers ===
+ns_pid_file() { echo "/tmp/openvpn-$1.pid"; }
+ns_log_file() { echo "/tmp/openvpn-$1.log"; }
+ns_socat_host_pid() { echo "/tmp/socat-host-$1.pid"; }
+ns_socat_ns_pid() { echo "/tmp/socat-ns-$1.pid"; }
+ns_opencode_serve_pid() { echo "/tmp/opencode-serve-$1.pid"; }
+ns_socat_opencode_pid() { echo "/tmp/socat-opencode-$1.pid"; }
+
+ns_is_running() {
+    sudo ip netns list | grep -qw "$1"
+}
+
+ns_vpn_connected() {
+    sudo ip netns exec "$1" ip addr show tun0 &>/dev/null
+}
+
+# === Utility ===
+get_iface() {
+    ip route | awk '/default/ {print $5; exit}'
+}
+
+has_socat() {
+    command -v socat >/dev/null
+}
+
+require_root_tools() {
+    command -v openvpn >/dev/null || {
+        err "openvpn no instalado"
+        exit 1
+    }
+}
+
+# === Core VPN operations ===
+ns_cleanup() {
+    local ns="$1"
+    local pid f
+    log "Deteniendo OpenVPN..."
+    pid=$(ns_pid_file "$ns")
+    if [[ -f "$pid" ]]; then
+        sudo kill "$(cat "$pid")" 2>/dev/null || true
+        sudo rm -f "$pid"
+    fi
+    log "Deteniendo ADB forwarders..."
+    for f in "$(ns_socat_host_pid "$ns")" "$(ns_socat_ns_pid "$ns")"; do
+        if [[ -f "$f" ]]; then
+            sudo kill "$(cat "$f")" 2>/dev/null || true
+            sudo rm -f "$f"
+        fi
+    done
+    log "Deteniendo OpenCode serve..."
+    f=$(ns_opencode_serve_pid "$ns")
+    if [[ -f "$f" ]]; then
+        sudo kill "$(cat "$f")" 2>/dev/null || true
+        sudo rm -f "$f"
+    fi
+    log "Deteniendo forwarder OpenCode..."
+    f=$(ns_socat_opencode_pid "$ns")
+    if [[ -f "$f" ]]; then
+        sudo kill "$(cat "$f")" 2>/dev/null || true
+        sudo rm -f "$f"
+    fi
+    log "Eliminando namespace..."
+    sudo ip netns delete "$ns" 2>/dev/null || true
+    log "Eliminando veth..."
+    sudo ip link delete "$VETH_HOST" 2>/dev/null || true
+}
+
+ns_start() {
+    local ns="$1" config="$2"
+
+    if [[ ! -f "$config" ]]; then
+        err "Archivo VPN no encontrado: $config"
+        exit 1
+    fi
+
+    require_root_tools
+
+    local inet_iface
+    inet_iface=$(get_iface)
+    if [[ -z "$inet_iface" ]]; then
+        err "No se pudo detectar interfaz principal"
+        exit 1
+    fi
+    log "Interfaz principal: $inet_iface"
+
+    ns_cleanup "$ns"
+
+    log "Creando namespace..."
+    sudo ip netns add "$ns"
+    sudo ip netns exec "$ns" ip link set lo up
+
+    log "Creando veth pair..."
+    sudo ip link add "$VETH_HOST" type veth peer name "$VETH_NS"
+    sudo ip link set "$VETH_NS" netns "$ns"
+
+    log "Configurando host..."
+    sudo ip addr add "$HOST_IP" dev "$VETH_HOST"
+    sudo ip link set "$VETH_HOST" up
+
+    log "Configurando namespace..."
+    sudo ip netns exec "$ns" ip addr add "$NS_IP" dev "$VETH_NS"
+    sudo ip netns exec "$ns" ip link set "$VETH_NS" up
+    sudo ip netns exec "$ns" ip route add default via 10.200.1.1
+
+    log "Configurando DNS..."
+    sudo mkdir -p "/etc/netns/$ns"
+    echo "nameserver $DNS_SERVER" | sudo tee "/etc/netns/$ns/resolv.conf" >/dev/null
+
+    log "Activando forwarding..."
+    sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+    log "Configurando NAT..."
+    sudo iptables -t nat -C POSTROUTING \
+        -s 10.200.1.0/24 \
+        -o "$inet_iface" \
+        -j MASQUERADE 2>/dev/null || \
+    sudo iptables -t nat -A POSTROUTING \
+        -s 10.200.1.0/24 \
+        -o "$inet_iface" \
+        -j MASQUERADE
+
+    log "Verificando conectividad..."
+    sudo ip netns exec "$ns" ping -c 1 1.1.1.1 >/dev/null
+
+    if has_socat; then
+        log "Iniciando ADB forwarders..."
+        sudo socat TCP-LISTEN:5037,bind=10.200.1.1,fork,reuseaddr TCP:127.0.0.1:5037 >/dev/null 2>&1 &
+        echo $! | sudo tee "$(ns_socat_host_pid "$ns")" >/dev/null
+        sudo ip netns exec "$ns" socat TCP-LISTEN:5037,bind=127.0.0.1,fork,reuseaddr TCP:10.200.1.1:5037 >/dev/null 2>&1 &
+        echo $! | sudo tee "$(ns_socat_ns_pid "$ns")" >/dev/null
+    fi
+
+    log "Iniciando OpenVPN..."
+    sudo ip netns exec "$ns" openvpn \
+        --config "$config" \
+        --daemon \
+        --resolv-retry infinite \
+        --log "$(ns_log_file "$ns")" \
+        --writepid "$(ns_pid_file "$ns")" >/dev/null 2>&1
+
+    log "Esperando tun0..."
+    for i in {1..20}; do
+        if ns_vpn_connected "$ns"; then
+            break
+        fi
+        sleep 1
+    done
+
+    if ! ns_vpn_connected "$ns"; then
+        err "VPN no conectó"
+        echo
+        sudo cat "$(ns_log_file "$ns")"
+        ns_cleanup "$ns"
+        exit 1
+    fi
+
+    local vpn_ip
+    vpn_ip=$(sudo ip netns exec "$ns" curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "")
+    if [[ ! "$vpn_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        vpn_ip="offline"
+    fi
+
+    save_space "$ns" "$(basename "$config")" "$vpn_ip"
+    set_last_ns "$ns"
+
+    echo
+    hdr "=================================="
+    hdr " Namespace : $ns"
+    hdr " VPN IP    : $vpn_ip"
+    hdr "=================================="
+    echo
+}
+
+ns_status() {
+    local ns="$1"
+    if ! ns_is_running "$ns"; then
+        err "Namespace '$ns' no existe"
+        return 1
+    fi
+    log "Namespace: $ns"
+    echo
+    log "Interfaces:"
+    sudo ip netns exec "$ns" ip addr 2>/dev/null
+    echo
+    log "Rutas:"
+    sudo ip netns exec "$ns" ip route 2>/dev/null
+    echo
+    if ns_vpn_connected "$ns"; then
+        local ip
+        ip=$(sudo ip netns exec "$ns" curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "")
+        if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            ip="offline"
+        fi
+        log "VPN conectada"
+        log "IP VPN: $ip"
+    else
+        warn "tun0 no existe"
+    fi
+}
+
+ns_shell() {
+    local ns="$1"
+    if ! ns_is_running "$ns"; then
+        err "Namespace '$ns' no existe"
+        exit 1
+    fi
+    sudo ip netns exec "$ns" bash
+}
+
+ns_exec() {
+    local ns="$1"
+    shift
+    if ! ns_is_running "$ns"; then
+        err "Namespace '$ns' no existe"
+        exit 1
+    fi
+    if [[ $# -eq 0 ]]; then
+        err "Uso: $0 <comando> [args...]"
+        exit 1
+    fi
+    local rows cols
+    read rows cols <<< $(stty size 2>/dev/null || echo "24 80")
+    script -q -c "sudo ip netns exec $ns runuser -u $ORIG_USER -- sh -c 'stty rows $rows cols $cols && exec $*'" /dev/null
+}
+
+ns_enter() {
+    local ns="$1"
+    if ! ns_is_running "$ns"; then
+        err "Namespace '$ns' no existe"
+        exit 1
+    fi
+    local rows cols
+    read rows cols <<< $(stty size 2>/dev/null || echo "24 80")
+    log "Entrando al namespace '$ns' como $ORIG_USER"
+    log "Usa 'exit' para salir"
+    echo
+    script -q -c "sudo ip netns exec $ns runuser -u $ORIG_USER -- sh -c 'stty rows $rows cols $cols && exec bash'" /dev/null
+}
+
+ns_serve() {
+    local ns="$1"
+    local port="${2:-$OPENCODE_PORT}"
+    local serve_pid_file socat_pid_file
+
+    serve_pid_file=$(ns_opencode_serve_pid "$ns")
+    socat_pid_file=$(ns_socat_opencode_pid "$ns")
+
+    if ! ns_is_running "$ns"; then
+        err "Namespace '$ns' no existe. Inicia la VPN primero."
+        exit 1
+    fi
+
+    if [[ -f "$serve_pid_file" ]] && kill -0 "$(cat "$serve_pid_file")" 2>/dev/null; then
+        log "OpenCode serve ya está corriendo (PID: $(cat "$serve_pid_file"))"
+    else
+        log "Iniciando OpenCode serve en puerto $port..."
+        sudo ip netns exec "$ns" runuser -u "$ORIG_USER" -- \
+            opencode serve --port "$port" --hostname "0.0.0.0" < /dev/null > /dev/null 2>&1 &
+        local spid=$!
+        echo "$spid" | sudo tee "$serve_pid_file" >/dev/null
+        sleep 3
+        if kill -0 "$spid" 2>/dev/null; then
+            log "OpenCode serve iniciado (PID: $spid)"
+        else
+            err "OpenCode serve no arrancó. Revisa los logs."
+            exit 1
+        fi
+    fi
+
+    log "Configurando forward: 127.0.0.1:$port -> namespace 10.200.1.2:$port"
+    sudo socat TCP-LISTEN:"$port",bind=127.0.0.1,fork,reuseaddr TCP:10.200.1.2:"$port" < /dev/null > /dev/null 2>&1 &
+    echo $! | sudo tee "$socat_pid_file" >/dev/null
+    sleep 1
+
+    echo
+    hdr "=================================="
+    hdr " Conectate desde OTRO terminal con:"
+    hdr "   opencode attach http://127.0.0.1:$port"
+    hdr "=================================="
+    echo
+}
+
+# === Interactive selectors (fish) ===
+select_ovpn() {
+    local G R N
+    G=$(tput setaf 2 2>/dev/null || printf '\033[32m')
+    R=$(tput setaf 1 2>/dev/null || printf '\033[31m')
+    N=$(tput sgr0 2>/dev/null || printf '\033[0m')
+
+    # Build lookup: cfg -> ns_name|ip|ts
+    declare -A map
+    local ns cfg ip ts
+    while IFS='|' read -r ns cfg ip ts; do
+        map["$cfg"]="$ns|$ip|$ts"
+    done < "$SPACES_FILE" || true
+
+    local lines=()
+
+    # Files WITHOUT a space: mtime order (oldest first)
+    local f
+    while IFS= read -r f; do
+        local b
+        b=$(basename "$f")
+        [[ -z "${map[$b]:-}" ]] && lines+=("$b")
+    done < <(ls -1tr "$VPN_DIR"/*.ovpn 2>/dev/null || true) || true
+
+    # Files WITH a space: spaces-file order (oldest connection first)
+    while IFS='|' read -r ns cfg ip ts; do
+        [[ ! -f "$VPN_DIR/$cfg" ]] && continue
+        local txt col
+        if ns_is_running "$ns" 2>/dev/null && ns_vpn_connected "$ns" 2>/dev/null; then
+            col="$G"
+            [[ -z "$ip" || "$ip" == "offline" ]] && txt="Connected" || txt="$ip"
+        else
+            col="$R"
+            txt="offline"
+        fi
+        lines+=("${cfg} → ${col}● ${txt}${N}")
+    done < "$SPACES_FILE" || true
+
+    if [[ ${#lines[@]} -eq 0 ]]; then
+        echo "No hay archivos .ovpn en $VPN_DIR"
+        return 1
+    fi
+    if [[ ${#lines[@]} -eq 1 ]]; then
+        echo "${lines[0]%% →*}"
+        return 0
+    fi
+
+    local sel
+    sel=$(printf '%s\n' "${lines[@]}" | fzf --ansi --tac --prompt='Select VPN > ' --height=~40%) || return 1
+    echo "${sel%% →*}"
+}
+
+select_space() {
+    local ovpn_name="$1"
+    fish -c "
+        set options '+ Crear nuevo espacio'
+        while read -l line
+            set parts (string split '|' \$line)
+            if test (count \$parts) -ge 3
+                set options \$options (string trim \$parts[1])' -> '\$parts[3]
+            end
+        end < $SPACES_FILE
+        set selection (
+            printf '%s\n' \$options | fzf --prompt='Select space > ' --height=~40%
+        )
+        if test -z \"\$selection\"
+            exit 1
+        end
+        echo \$selection
+    " 2>/dev/null || return 1
+}
+
+auto_name() {
+    local config_name="$1"
+    local base
+    base=$(basename "$config_name" .ovpn | LC_ALL=C sed 's/[^_a-zA-Z0-9-]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//')
+    [[ -z "$base" ]] && base="space"
+
+    local final="$base"
+    local suffix=1
+    while grep -q "^$final|" "$SPACES_FILE" 2>/dev/null; do
+        final="${base}-${suffix}"
+        ((suffix++))
+    done
+    echo "$final"
+}
+
+# === Saved space selector (with relative time) ===
+select_saved_space() {
+    local prompt="${1:-Select space > }"
+    fish -c "
+        set lines
+        while read -l line
+            set parts (string split '|' \$line)
+            if test (count \$parts) -ge 4
+                set now (date +%s)
+                set then (date -d \$parts[4] +%s 2>/dev/null)
+                if test -z \"\$then\"
+                    set then 0
+                end
+                set diff (math \"\$now - \$then\" 2>/dev/null)
+                if test -z \"\$diff\"
+                    set diff 0
+                end
+                if test \$diff -lt 60
+                    set rel \"ahora\"
+                else if test \$diff -lt 3600
+                    set mins (math --scale=0 \"\$diff / 60\" 2>/dev/null)
+                    set rel \"hace \"\$mins\"min\"
+                else if test \$diff -lt 86400
+                    set hours (math --scale=0 \"\$diff / 3600\" 2>/dev/null)
+                    set rel \"hace \"\$hours\"h\"
+                else
+                    set days (math --scale=0 \"\$diff / 86400\" 2>/dev/null)
+                    set rel \"hace \"\$days\"d\"
+                end
+                set lines \$lines (string trim \$parts[1])' -> '\$parts[3]' ('\$rel')'
+            end
+        end < $SPACES_FILE
+
+        if test (count \$lines) -eq 0
+            echo 'No hay espacios guardados'
+            exit 1
+        end
+
+        set selection (
+            printf '%s\n' \$lines | fzf --prompt='$prompt' --height=~40%
+        )
+        if test -z \"\$selection\"
+            exit 1
+        end
+        echo \$selection
+    " 2>/dev/null || return 1
+}
+
+restart_interactive() {
+    log "Espacios guardados:"
+    echo
+    local choice
+    choice=$(select_saved_space "Select space to restart > ") || {
+        warn "No se seleccionó ningún espacio"
+        exit 1
+    }
+    local ns_name
+    ns_name=$(echo "$choice" | sed 's/ ->.*//' | xargs)
+    local config_name
+    config_name=$(get_space_config "$ns_name")
+    local config_path="$VPN_DIR/$config_name"
+
+    if [[ -z "$config_name" || ! -f "$config_path" ]]; then
+        err "No se encontró el archivo de configuración para '$ns_name'"
+        exit 1
+    fi
+
+    log "Reiniciando espacio: $ns_name"
+    ns_cleanup "$ns_name"
+    ns_start "$ns_name" "$config_path"
+}
+
+stop_interactive() {
+    log "Espacios guardados:"
+    echo
+    local choice
+    choice=$(select_saved_space "Select space to stop > ") || {
+        warn "No se seleccionó ningún espacio"
+        exit 1
+    }
+    local ns_name
+    ns_name=$(echo "$choice" | sed 's/ ->.*//' | xargs)
+
+    log "Deteniendo espacio: $ns_name"
+    ns_cleanup "$ns_name"
+
+    local last
+    last=$(cat "${CONFIG_DIR}/last" 2>/dev/null || echo "")
+    if [[ "$last" == "$ns_name" ]]; then
+        local next
+        next=$(grep -v "^$ns_name|" "$SPACES_FILE" 2>/dev/null | tail -1 | cut -d'|' -f1 || echo "")
+        if [[ -n "$next" ]]; then
+            set_last_ns "$next"
+        else
+            rm -f "${CONFIG_DIR}/last"
+        fi
+    fi
+
+    remove_space "$ns_name"
+    log "Espacio '$ns_name' eliminado"
+}
+
+show_spaces() {
+    if [[ ! -s "$SPACES_FILE" ]]; then
+        warn "  (ninguno)"
+        return
+    fi
+    while IFS='|' read -r name cfg ip ts; do
+        local state="stopped"
+        local color="$RED"
+        if ns_is_running "$name" 2>/dev/null; then
+            if ns_vpn_connected "$name" 2>/dev/null; then
+                state="connected"
+                color="$GREEN"
+            else
+                state="running"
+                color="$YELLOW"
+            fi
+        fi
+        local display_ip="$ip"
+        if [[ "$ip" == "offline" || -z "$ip" ]]; then
+            display_ip="offline"
+            color="$RED"
+            [[ "$state" == "connected" ]] && state="offline"
+        fi
+        printf "  %-25s ${color}%-16s${NC} [${color}%s${NC}]\n" "$name" "$display_ip" "$state"
+    done < "$SPACES_FILE"
+}
+
+# === Interactive entry point ===
+interactive() {
+    if [[ -s "$SPACES_FILE" ]]; then
+        hdr "━━━ Espacios guardados ━━━"
+        show_spaces
+        hdr "━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo
+    fi
+
+    log "VPNs disponibles:"
+    echo
+    local ovpn
+    ovpn=$(select_ovpn) || {
+        warn "No se seleccionó ninguna VPN"
+        exit 1
+    }
+    local ovpn_path="$VPN_DIR/$ovpn"
+    if [[ ! -f "$ovpn_path" ]]; then
+        ovpn_path="$ovpn"
+    fi
+
+    log "VPN seleccionada: $(basename "$ovpn_path")"
+    echo
+
+    local choice
+    choice=$(select_space "$(basename "$ovpn_path")") || {
+        warn "No se seleccionó ningún espacio"
+        exit 1
+    }
+
+    if echo "$choice" | grep -q "Crear nuevo espacio"; then
+        local ns_name
+        ns_name=$(auto_name "$(basename "$ovpn_path")")
+        log "Creando espacio: $ns_name"
+        ns_cleanup "$ns_name"
+        ns_start "$ns_name" "$ovpn_path"
+    else
+        local ns_name
+        ns_name=$(echo "$choice" | sed 's/ ->.*//' | xargs)
+        log "Usando espacio existente: $ns_name"
+        ns_cleanup "$ns_name"
+        ns_start "$ns_name" "$ovpn_path"
+    fi
+}
+
+# === Running namespace selector ===
+select_ns_for_cmd() {
+    local G R N
+    G=$(tput setaf 2 2>/dev/null || printf '\033[32m')
+    R=$(tput setaf 1 2>/dev/null || printf '\033[31m')
+    N=$(tput sgr0 2>/dev/null || printf '\033[0m')
+
+    local names=() lines=()
+    local ns cfg ip ts
+    while IFS='|' read -r ns cfg ip ts; do
+        if ns_is_running "$ns" 2>/dev/null; then
+            local state col
+            if ns_vpn_connected "$ns" 2>/dev/null; then
+                state="connected"
+                col="$G"
+            else
+                state="running"
+                col="$R"
+            fi
+            [[ -z "$ip" ]] && ip="offline"
+            names+=("$ns")
+            printf -v line '%s → %b● %s%b' "$ns" "$col" "$ip" "$N"
+            lines+=("$line")
+        fi
+    done < "$SPACES_FILE" || true
+
+    if [[ ${#names[@]} -eq 0 ]]; then
+        return 1
+    fi
+    if [[ ${#names[@]} -eq 1 ]]; then
+        echo "${names[0]}"
+        return 0
+    fi
+
+    local sel
+    sel=$(printf '%s\n' "${lines[@]}" | fzf --ansi --tac --prompt='Select namespace > ' --height=~40%) || return 1
+    echo "${sel%% →*}"
+}
+
+# === Usage ===
+usage() {
+    echo
+    hdr "Uso:"
+    echo "  $0                        Modo interactivo"
+    echo "  $0 list                   Listar VPNs disponibles"
+    echo "  $0 start                  Iniciar VPN (seleccionar .ovpn)"
+    echo "  $0 restart                Reiniciar espacio guardado"
+    echo "  $0 stop                   Detener VPN activa"
+    echo "  $0 status                 Estado de la VPN"
+    echo "  $0 shell                  Shell en el namespace"
+    echo "  $0 enter                  Entrar al namespace"
+    echo "  $0 serve [puerto]         Iniciar OpenCode serve"
+    echo "  $0 attach [puerto]        Conectar a OpenCode"
+    echo "  $0 <cmd> [args...]        Ejecutar comando en namespace activo"
+    echo
+    hdr "Espacios guardados:"
+    show_spaces
+    echo
+}
+
+# === Main ===
+case "${1:-}" in
+    list|ls)
+        log "VPNs en $VPN_DIR:"
+        ls -1t "$VPN_DIR"/*.ovpn 2>/dev/null | while read -r f; do
+            echo "  $(basename "$f")"
+        done || warn "  (no hay archivos .ovpn)"
+        ;;
+
+    start)
+        interactive
+        ;;
+
+    restart|reboot)
+        restart_interactive
+        ;;
+
+    stop)
+        stop_interactive
+        ;;
+
+    status)
+        ns=$(cat "${CONFIG_DIR}/last" 2>/dev/null || echo "vpnns")
+        ns_status "$ns" || {
+            echo
+            hdr "Espacios guardados:"
+            show_spaces
+        }
+        ;;
+
+    shell)
+        ns=$(cat "${CONFIG_DIR}/last" 2>/dev/null || echo "vpnns")
+        ns_shell "$ns"
+        ;;
+
+    enter)
+        ns=$(cat "${CONFIG_DIR}/last" 2>/dev/null || echo "vpnns")
+        ns_enter "$ns"
+        ;;
+
+    serve)
+        ns=$(cat "${CONFIG_DIR}/last" 2>/dev/null || echo "vpnns")
+        ns_serve "$ns" "${2:-}"
+        ;;
+
+    attach)
+        port="${2:-$OPENCODE_PORT}"
+        opencode attach "http://127.0.0.1:$port"
+        ;;
+
+    --help|-h|help)
+        usage
+        ;;
+
+    *)
+        if [[ $# -eq 0 ]]; then
+            interactive
+        else
+            cmd_ns=$(select_ns_for_cmd) || {
+                err "No hay namespaces activos. Inicia una VPN primero."
+                exit 1
+            }
+            ns_exec "$cmd_ns" "$@"
+        fi
+        ;;
+esac
