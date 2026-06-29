@@ -1,18 +1,32 @@
 # openfzf — OpenCode Session Browser
 
-fzf-based TUI to browse, filter, and launch OpenCode sessions with optional VPN namespace isolation.
+Tired of losing track of your OpenCode sessions? Forgot which directory you were working on? Lost that important fork you created hours ago?
+
+**openfzf** is a fzf-powered TUI that organizes, filters, and launches every OpenCode session on your machine. No more duplicate sessions, no more guessing which project is which — everything in one place, beautifully presented.
+
+## Screenshots
+
+![openfzf main menu](screenshots/fzf.png)
+*Main session list (level 1) showing deduplicated sessions grouped by title, with agent type, color-coded timestamps (green <2d, yellow <7d, red >7d), directory, VPN tag, and fork count. The "+ New Session" entry is always on top.*
+
+![openfzf forks](screenshots/fork.png)
+*Fork expansion (level 2) showing all individual sessions for a given title. Accessed via Ctrl+E from level 1. Each entry shows the full timestamp, agent, and directory. Press Esc to return to level 1.*
+
+![openfzf VPN selector](screenshots/vpns.png)
+*VPN namespace selector with three states: Local (host), running namespaces (● green = VPN connected, ○ red = VPN offline), and "Crear New VPN" to create a new namespace inline. Inactive namespaces appear dimmed and cannot be selected.*
 
 ## Features
 
-- **Two-level session browser** — list deduplicated sessions (level 1), expand forks (level 2)
+- **Two-level session browser** — list deduplicated sessions (level 1), expand forks (level 2) with Ctrl+E
 - **Agent filtering** — show only `build`/`plan` by default; `--all`, `--plan`, `--build`, `--explore`, `--general`
 - **VPN namespace selector** — pick Local or an existing VPN namespace; create new VPNs inline
-- **Recency ordering** — sessions opened last appear first (tiny SQLite cache)
+- **Recency ordering** — sessions opened last appear first (tiny SQLite cache at `~/.cache/openfzf/opened.db`)
 - **Color-coded dates** — green <2d, yellow <7d, red >7d (based on `time_updated`)
 - **Adaptive columns** — title/dir widths auto-adjust to terminal size
-- **Kitty integration** — opens sessions in new tabs (Local) or new windows (namespace)
+- **Kitty integration** — opens sessions in new OS windows (Local) or terminals inside namespaces
 - **Persistent menu** — fzf stays open after launching a session; Esc in level 2 returns to level 1
 - **`--no-vpn` flag** — skip the space selector entirely, always open locally
+- **VPN auto-detection** — detects active VPN namespaces with `tun0` and tags sessions with a green "VPN" label
 
 ## Requirements
 
@@ -83,11 +97,11 @@ openfzf
 │
 ├── Space selector (select_space)
 │   fzf menu: Local / running namespaces / Crear New VPN
-│   Extracts space name via cut -d'|' -f1
+│   Dimmed entries cannot be selected (loop re-shows selector)
 │
 └── Session launcher (open_session / new_session)
-    ├── Local → kitty @ launch (tab) — opencode --session <id>
-    └── Namespace → kitty --hold (new window) — ip netns exec ... opencode --session <id>
+    ├── Local → kitty @ launch --type=os-window (new window)
+    └── Namespace → kitty --hold + sudo ip netns exec ... opencode
 ```
 
 ### Recency cache
@@ -109,6 +123,7 @@ The main OpenCode DB (at `~/.local/share/opencode/opencode.db`) is ATTACHed and 
 | `OPENFZF_ALL` | empty | Show all sessions (skip dedup, flat list) |
 | `OPENFZF_DEBUG` | empty | Print debug info to stderr |
 | `OPENFZF_LOG` | empty | Write debug log to file |
+| `VPN_TIMEOUT` | 30 | Seconds to wait for tun0 when creating a VPN |
 
 ### Config files
 
@@ -123,10 +138,10 @@ The main OpenCode DB (at `~/.local/share/opencode/opencode.db`) is ATTACHed and 
 
 **fzf doesn't open:** ensure `fzf` is installed and you're in a terminal (not piped).
 
-**"Cannot open network namespace" with extra text:** the `select_space` parser was fixed to use `cut -d'|' -f1`. Make sure you have the latest version.
+**"Cannot open network namespace" with extra text:** the `select_space` parser uses `cut -d'|' -f1`. Make sure you have the latest version.
 
 **VPN creation fails:** check that OpenVPN configs exist in `~/Downloads/VPNS/`, that `sudo` has NOPASSWD, and that `openvpn` is installed.
 
 **Session doesn't appear in list:** the default filter only shows `build` and `plan` agents. Use `--all` to see everything.
 
-**Port conflicts in namespace:** each namespace uses `10.200.1.0/24` — only one namespace with VPN can run at a time without manual reconfiguration.
+**Port conflicts in namespace:** each namespace uses a unique subnet (10.200.N.0/24). Multiple namespaces can run simultaneously without conflicts.
