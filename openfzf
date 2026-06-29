@@ -455,11 +455,113 @@ create_new_vpn() {
     ns_start "$ns_name" "$ovpn_path"
 }
 
+# === First-time setup ===
+first_run_setup() {
+    echo
+    hdr "╔════════════════════════════════════╗"
+    hdr "║   openfzf — First-time setup       ║"
+    hdr "╚════════════════════════════════════╝"
+    echo
+
+    local check_ok=true
+
+    check_tool() {
+        local name="$1" binary="$2" required="${3:-no}"
+        if command -v "$binary" &>/dev/null; then
+            local ver
+            ver=$("$binary" --version 2>/dev/null | head -1 | grep -oP '[\d]+\.[\d]+\.[\d]+' | head -1 || true)
+            [[ -n "$ver" ]] && ver=" $ver" || ver=""
+            printf "  ${GREEN}[✓]${NC} %-12s %s%s\n" "$name" "$(command -v "$binary")" "$ver"
+        else
+            printf "  ${RED}[✗]${NC} %-12s %s\n" "$name" "(not found)"
+            [[ "$required" == "yes" ]] && check_ok=false
+        fi
+    }
+
+    printf "  ${BOLD}Requisitos:${NC}\n"
+    check_tool "fzf"      "fzf"      "yes"
+    check_tool "sqlite3"  "sqlite3"  "yes"
+    check_tool "fish"     "fish"     "no"
+    check_tool "curl"     "curl"     "no"
+    check_tool "socat"    "socat"    "no"
+    check_tool "runuser"  "runuser"  "no"
+    check_tool "openvpn"  "openvpn"  "no"
+
+    # Bash version
+    if (( BASH_VERSINFO[0] >= 4 )); then
+        printf "  ${GREEN}[✓]${NC} %-12s bash %d\n" "bash" "$BASH_VERSINFO[0]"
+    else
+        printf "  ${RED}[✗]${NC} %-12s bash 4+ required (found %d)\n" "bash" "$BASH_VERSINFO[0]"
+        check_ok=false
+    fi
+
+    # Sudo -n
+    if sudo -n true 2>/dev/null; then
+        printf "  ${GREEN}[✓]${NC} %-12s sudo -n (NOPASSWD)\n" "sudo"
+    else
+        printf "  ${RED}[✗]${NC} %-12s sudo -n requires NOPASSWD in sudoers\n" "sudo"
+    fi
+
+    # OpenCode session DB
+    if [[ -f "$DB" ]]; then
+        printf "  ${GREEN}[✓]${NC} %-12s %s\n" "opencode DB" "$DB"
+    else
+        printf "  ${YELLOW}[!]${NC} %-12s %s (not found — run opencode first)\n" "opencode DB" "$DB"
+    fi
+
+    echo
+
+    # Cache directory
+    printf "  ${BOLD}Cache:${NC}\n"
+    mkdir -p "$CACHE_DIR"
+    sqlite3 "$OPENED_DB" "CREATE TABLE IF NOT EXISTS opened (id TEXT PRIMARY KEY, last_opened INTEGER);" 2>/dev/null || true
+    printf "  ${GREEN}[✓]${NC} %-12s %s\n" "cache" "$CACHE_DIR"
+    printf "  ${GREEN}[✓]${NC} %-12s %s\n" "opened.db" "$OPENED_DB"
+
+    echo
+
+    # VPN config check (optional)
+    printf "  ${BOLD}VPN (opcional):${NC}\n"
+    if [[ -d "${HOME}/.config/vpns" ]]; then
+        printf "  ${GREEN}[✓]${NC} %-12s %s\n" "vpns config" "${HOME}/.config/vpns"
+    else
+        printf "  ${YELLOW}[!]${NC} %-12s %s (not found — install vpns for VPN support)\n" "vpns config" "${HOME}/.config/vpns"
+    fi
+
+    echo
+
+    # PATH check
+    printf "  ${BOLD}PATH:${NC}\n"
+    local bindir
+    bindir=$(dirname "$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")")
+    if command -v openfzf &>/dev/null && [[ "$(command -v openfzf)" == "$bindir/openfzf" ]]; then
+        printf "  ${GREEN}[✓]${NC} %-12s %s\n" "openfzf" "$(command -v openfzf)"
+    else
+        printf "  ${YELLOW}[!]${NC} %-12s openfzf no está en PATH\n" "openfzf"
+        if command -v fish &>/dev/null; then
+            printf "           → Ejecuta: ${BOLD}fish_add_path %s${NC}\n" "$bindir"
+        else
+            printf "           → Agrega a tu shell config: ${BOLD}export PATH=\"%s:\$PATH\"${NC}\n" "$bindir"
+        fi
+    fi
+
+    echo
+
+    if ! $check_ok; then
+        printf "  ${RED}[✗]${NC} Algunos requisitos faltan. Revisa las marcas rojas arriba.\n"
+        echo
+        exit 1
+    fi
+    printf "  ${GREEN}[✓]${NC} Todo listo. Ejecuta ${BOLD}openfzf${NC} para comenzar.\n"
+    echo
+}
+
 # Parse arguments
 NO_VPN=false
 AGENT_FLAGS=()
 for arg in "$@"; do
     case "$arg" in
+        --setup)              first_run_setup; exit 0 ;;
         --all)                AGENT_FLAGS=("ALL") ;;
         --plan)               AGENT_FLAGS+=("plan") ;;
         --build)              AGENT_FLAGS+=("build") ;;

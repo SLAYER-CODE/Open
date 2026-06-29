@@ -43,6 +43,7 @@ Tired of losing track of your OpenCode sessions? Forgot which directory you were
 ```bash
 cp openfzf ~/.local/bin/
 chmod +x ~/.local/bin/openfzf
+openfzf --setup                # verify dependencies, create cache, check PATH
 ```
 
 ## Usage
