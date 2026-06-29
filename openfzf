@@ -13,21 +13,18 @@ DB="${HOME}/.local/share/opencode/opencode.db"
 CACHE_DIR="${HOME}/.cache/openfzf"
 OPENED_DB="${CACHE_DIR}/opened.db"
 SPACES_FILE="${HOME}/.config/vpns/spaces"
-VPN_DIR="${HOME}/Downloads/VPNS"
-VETH_HOST="veth-host"
-VETH_NS="veth-vpn"
-HOST_IP="10.200.1.1/24"
-NS_IP="10.200.1.2/24"
 DNS_SERVER="1.1.1.1"
 OPENCODE_PORT=4096
+VPN_TIMEOUT="${VPN_TIMEOUT:-30}"
+SUBNET_COUNTER="${HOME}/.config/vpns/subnet_counter"
 SHOW_ALL_FORKS="${OPENFZF_ALL:-}"
 DEBUG="${OPENFZF_DEBUG:-}"
 DBGLOG="${OPENFZF_LOG:-}"
 
 if [[ -t 1 ]]; then
-    RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'
-    BLUE='\033[34m'; MAGENTA='\033[35m'; CYAN='\033[36m'
-    BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+    RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+    BLUE=$'\033[34m'; MAGENTA=$'\033[35m'; CYAN=$'\033[36m'
+    BOLD=$'\033[1m'; DIM=$'\033[2m'; NC=$'\033[0m'
 else
     RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; BOLD=''; DIM=''; NC=''
 fi
@@ -36,16 +33,49 @@ agent_color() {
     case "$1" in plan) echo "$BLUE" ;; build) echo "$GREEN" ;; create) echo "$GREEN" ;; explore) echo "$YELLOW" ;; general|"") echo "$CYAN" ;; *) echo "$NC"  ;; esac
 }
 
+CONFIG_DIR="${HOME}/.config/vpns"
+
+vpn_directories() {
+    local config_file="${CONFIG_DIR}/config" dirs=()
+    if [[ -f "$config_file" ]]; then
+        while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            line="${line/#\~/$HOME}"
+            line="${line/#\$HOME/$HOME}"
+            dirs+=("$line")
+        done < "$config_file"
+    fi
+    [[ ${#dirs[@]} -eq 0 ]] && dirs=("${HOME}/Downloads/VPNS")
+    printf '%s\n' "${dirs[@]}"
+}
+
+find_config() {
+    local config_name="$1" dir
+    while IFS= read -r dir; do
+        local result
+        result=$(find "$dir" -name "$config_name" -type f -print -quit 2>/dev/null) || true
+        [[ -n "$result" ]] && { echo "$result"; return 0; }
+    done < <(vpn_directories)
+    return 1
+}
+
 VPN_ACTIVE=""
-if [[ -f "$SPACES_FILE" ]]; then
-    while IFS='|' read -r name _; do
-        pid_file="/tmp/opencode-serve-${name}.pid"
-        if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
-            VPN_ACTIVE="$name"
-            break
-        fi
-    done < "$SPACES_FILE"
-fi
+detect_active_vpn() {
+    if [[ -f "$SPACES_FILE" ]]; then
+        local name
+        while IFS='|' read -r name _; do
+            if sudo -n ip netns list 2>/dev/null | grep -qw "$name"; then
+                if sudo -n ip netns exec "$name" ip addr show tun0 &>/dev/null 2>/dev/null; then
+                    echo "$name"
+                    return
+                fi
+            fi
+        done < "$SPACES_FILE"
+    fi
+}
+VPN_ACTIVE=$(detect_active_vpn)
 
 # Detect original user (for sudo namespace execution)
 ORIG_USER="${SUDO_USER:-$USER}"
@@ -53,11 +83,12 @@ ORIG_USER="${SUDO_USER:-$USER}"
 # === Space selector (VPN namespaces) ===
 select_space() {
     while true; do
-        local entries=()
-        local spaces=()
+        local entries=() spaces=()
+        declare -A times
         if [[ -f "$SPACES_FILE" ]]; then
-            while IFS='|' read -r name _ _ _; do
-                [[ -n "$name" ]] && spaces+=("$name")
+            local name cfg ip ts subnet
+            while IFS='|' read -r name cfg ip ts subnet; do
+                [[ -n "$name" ]] && spaces+=("$name") && times["$name"]="$ts"
             done < "$SPACES_FILE"
         fi
 
@@ -65,6 +96,9 @@ select_space() {
 
         local s running
         for s in "${spaces[@]}"; do
+            local t="${times[$s]:-}"
+            local time_str=""
+            [[ -n "$t" ]] && time_str="  ${BLUE}($(relative_time "$t"))${NC}"
             if sudo -n ip netns list 2>/dev/null | grep -qw "$s"; then
                 running=true
             else
@@ -72,12 +106,12 @@ select_space() {
             fi
             if [[ "$running" == "true" ]]; then
                 if sudo -n ip netns exec "$s" ip addr show tun0 &>/dev/null 2>/dev/null; then
-                    entries+=("$s|  ● ${s}")
+                    entries+=("$s|  ● ${s}${time_str}")
                 else
-                    entries+=("$s|  ○ ${s}")
+                    entries+=("$s|  ○ ${s}${time_str}")
                 fi
             else
-                entries+=("$s|${DIM}  ○ ${s}${NC}")
+                entries+=("$s|${DIM}  ○ ${s}${time_str}${NC}")
             fi
         done
 
@@ -86,8 +120,8 @@ select_space() {
         local selected
         selected=$(printf '%s\n' "${entries[@]}" | fzf --ansi --delimiter='|' --with-nth=2.. \
             --header="${DIM}Seleccionar espacio VPN | Enter=aceptar | Esc=cancelar${NC}" \
-            --reverse --cycle) || { echo "Local"; return; }
-        [[ -z "$selected" ]] && { echo "Local"; return; }
+            --reverse --cycle) || { echo ""; return 1; }
+        [[ -z "$selected" ]] && { echo ""; return 1; }
 
         local space
         space=$(cut -d'|' -f1 <<< "$selected")
@@ -112,13 +146,63 @@ ns_socat_ns_pid() { echo "/tmp/socat-ns-$1.pid"; }
 ns_opencode_serve_pid() { echo "/tmp/opencode-serve-$1.pid"; }
 ns_socat_opencode_pid() { echo "/tmp/socat-opencode-$1.pid"; }
 
-get_iface() { ip route | awk '/default/ {print $5; exit}'; }
+get_iface() {
+    ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}' || \
+    ip route 2>/dev/null | awk '/default/ {print $5; exit}' || \
+    echo "eth0"
+}
 
 ns_is_running() { sudo -n ip netns list 2>/dev/null | grep -qw "$1"; }
 
 ns_vpn_connected() { sudo -n ip netns exec "$1" ip addr show tun0 &>/dev/null 2>/dev/null; }
 
 has_socat() { command -v socat &>/dev/null; }
+
+relative_time() {
+    local ts="$1"
+    local ts_epoch now_epoch diff
+    ts_epoch=$(date -u -d "$ts" +%s 2>/dev/null) || { echo ""; return; }
+    now_epoch=$(date -u +%s)
+    diff=$((now_epoch - ts_epoch))
+    if (( diff < 60 )); then
+        echo "hace ${diff}s"
+    elif (( diff < 3600 )); then
+        echo "hace $((diff / 60))min"
+    elif (( diff < 86400 )); then
+        echo "hace $((diff / 3600))h"
+    else
+        echo "hace $((diff / 86400))d"
+    fi
+}
+
+ns_veth_host() { echo "vh-$(echo "$1" | md5sum | head -c6)"; }
+ns_veth_ns()   { echo "vn-$(echo "$1" | md5sum | head -c6)"; }
+
+get_space_subnet() {
+    grep "^$1|" "$SPACES_FILE" 2>/dev/null | cut -d'|' -f5 || echo ""
+}
+
+ns_alloc_subnet() {
+    local ns="$1" idx
+    idx=$(get_space_subnet "$ns")
+    [[ -n "$idx" ]] && { echo "$idx"; return; }
+    local next=1
+    if [[ -f "$SUBNET_COUNTER" ]]; then
+        next=$(< "$SUBNET_COUNTER")
+    else
+        local max_idx
+        max_idx=$(cut -d'|' -f5 "$SPACES_FILE" 2>/dev/null | sort -n | tail -1)
+        [[ -n "$max_idx" ]] && next="$max_idx"
+    fi
+    next=$((next + 1))
+    echo "$next" > "$SUBNET_COUNTER"
+    echo "$next"
+}
+
+ns_host_ip()   { local i; i=$(ns_alloc_subnet "$1"); echo "10.200.$i.1/24"; }
+ns_ns_ip()     { local i; i=$(ns_alloc_subnet "$1"); echo "10.200.$i.2/24"; }
+ns_subnet_cidr(){ local i; i=$(ns_alloc_subnet "$1"); echo "10.200.$i.0/24"; }
+ns_gateway()   { local i; i=$(ns_alloc_subnet "$1"); echo "10.200.$i.1"; }
 
 ns_cleanup() {
     local ns="$1" pid f
@@ -150,7 +234,14 @@ ns_cleanup() {
     echo "[+] Eliminando namespace..." >&2
     sudo ip netns delete "$ns" 2>/dev/null || true
     echo "[+] Eliminando veth..." >&2
-    sudo ip link delete "$VETH_HOST" 2>/dev/null || true
+    sudo ip link delete "$(ns_veth_host "$ns")" 2>/dev/null || true
+    local subnet_idx inet_iface
+    subnet_idx=$(get_space_subnet "$ns")
+    if [[ -n "$subnet_idx" ]]; then
+        inet_iface=$(get_iface)
+        echo "[+] Eliminando regla NAT..." >&2
+        sudo iptables -t nat -D POSTROUTING -s "10.200.$subnet_idx.0/24" -o "$inet_iface" -j MASQUERADE 2>/dev/null || true
+    fi
 }
 
 auto_name() {
@@ -166,30 +257,52 @@ auto_name() {
 }
 
 save_space() {
-    local ns="$1" config="$2" ip="$3" ts
+    local ns="$1" config="$2" ip="$3" subnet="$4" ts
     ts=$(date -u +"%Y-%m-%dT%H:%M:%S")
     grep -v "^$ns|" "$SPACES_FILE" 2>/dev/null > "${SPACES_FILE}.tmp" || true
-    echo "$ns|$config|$ip|$ts" >> "${SPACES_FILE}.tmp"
+    echo "$ns|$config|$ip|$ts|$subnet" >> "${SPACES_FILE}.tmp"
     mv "${SPACES_FILE}.tmp" "$SPACES_FILE"
 }
 
 select_ovpn() {
     declare -A map
-    local ns cfg ip ts f b
-    while IFS='|' read -r ns cfg ip ts; do
+    local ns cfg ip ts subnet
+    while IFS='|' read -r ns cfg ip ts subnet; do
         map["$cfg"]="$ns|$ip|$ts"
     done < "$SPACES_FILE" || true
 
-    local lines=()
+    local lines=() dir all_ovpn=()
 
-    while IFS= read -r f; do
+    while IFS= read -r dir; do
+        while IFS= read -r -d '' f; do
+            all_ovpn+=("$f")
+        done < <(find "$dir" -name '*.ovpn' -type f -print0 2>/dev/null || true) || true
+    done < <(vpn_directories)
+
+    short_label() {
+        local fp="$1" d
+        while IFS= read -r d; do
+            if [[ "$fp" == "$d"* ]]; then
+                local rel="${fp#$d/}"
+                echo "$(basename "$d")/$rel"
+                return
+            fi
+        done < <(vpn_directories)
+        basename "$fp"
+    }
+
+    local f
+    for f in "${all_ovpn[@]}"; do
+        local b
         b=$(basename "$f")
-        [[ -z "${map[$b]:-}" ]] && lines+=("$b")
-    done < <(ls -1tr "$VPN_DIR"/*.ovpn 2>/dev/null || true) || true
+        [[ -z "${map[$b]:-}" ]] && lines+=("$(short_label "$f")")
+    done
 
-    while IFS='|' read -r ns cfg ip ts; do
-        [[ ! -f "$VPN_DIR/$cfg" ]] && continue
-        local txt col
+    while IFS='|' read -r ns cfg ip ts subnet; do
+        local cfg_path
+        cfg_path=$(find_config "$cfg") || continue
+        local label txt col
+        label=$(short_label "$cfg_path")
         if ns_is_running "$ns" 2>/dev/null && ns_vpn_connected "$ns" 2>/dev/null; then
             col="$GREEN"
             [[ -z "$ip" || "$ip" == "offline" ]] && txt="Connected" || txt="$ip"
@@ -197,21 +310,22 @@ select_ovpn() {
             col="$RED"
             txt="offline"
         fi
-        lines+=("${cfg} → ${col}● ${txt}${NC}")
+        lines+=("${label} → ${col}● ${txt}${NC}  ${BLUE}($(relative_time "$ts"))${NC}")
     done < "$SPACES_FILE" || true
 
     if [[ ${#lines[@]} -eq 0 ]]; then
-        echo "No hay archivos .ovpn en $VPN_DIR" >&2
+        echo "No hay archivos .ovpn en los directorios configurados" >&2
+        echo "(revisa ~/.config/vpns/config)" >&2
         return 1
-    fi
-    if [[ ${#lines[@]} -eq 1 ]]; then
-        echo "${lines[0]%% →*}"
-        return 0
     fi
 
     local sel
-    sel=$(printf '%s\n' "${lines[@]}" | fzf --ansi --tac --prompt='Select VPN > ' --height=~40%) || return 1
-    echo "${sel%% →*}"
+    if [[ ${#lines[@]} -eq 1 ]]; then
+        sel="${lines[0]}"
+    else
+        sel=$(printf '%s\n' "${lines[@]}" | fzf --ansi --tac --prompt='Select VPN > ' --height=~40%) || return 1
+    fi
+    basename "${sel%% →*}"
 }
 
 ns_start() {
@@ -228,24 +342,34 @@ ns_start() {
     }
     echo "[+] Interfaz principal: $inet_iface" >&2
 
-    ns_cleanup "$ns"
+    if ns_is_running "$ns"; then
+        ns_cleanup "$ns"
+    fi
+
+    local vh vn hi ni gw subnet
+    vh=$(ns_veth_host "$ns")
+    vn=$(ns_veth_ns "$ns")
+    hi=$(ns_host_ip "$ns")
+    ni=$(ns_ns_ip "$ns")
+    gw=$(ns_gateway "$ns")
+    subnet=$(ns_subnet_cidr "$ns")
 
     echo "[+] Creando namespace..." >&2
     sudo ip netns add "$ns" || return 1
     sudo ip netns exec "$ns" ip link set lo up || return 1
 
     echo "[+] Creando veth pair..." >&2
-    sudo ip link add "$VETH_HOST" type veth peer name "$VETH_NS" || return 1
-    sudo ip link set "$VETH_NS" netns "$ns" || return 1
+    sudo ip link add "$vh" type veth peer name "$vn" || return 1
+    sudo ip link set "$vn" netns "$ns" || return 1
 
     echo "[+] Configurando host..." >&2
-    sudo ip addr add "$HOST_IP" dev "$VETH_HOST" || return 1
-    sudo ip link set "$VETH_HOST" up || return 1
+    sudo ip addr add "$hi" dev "$vh" || return 1
+    sudo ip link set "$vh" up || return 1
 
     echo "[+] Configurando namespace..." >&2
-    sudo ip netns exec "$ns" ip addr add "$NS_IP" dev "$VETH_NS" || return 1
-    sudo ip netns exec "$ns" ip link set "$VETH_NS" up || return 1
-    sudo ip netns exec "$ns" ip route add default via 10.200.1.1 || return 1
+    sudo ip netns exec "$ns" ip addr add "$ni" dev "$vn" || return 1
+    sudo ip netns exec "$ns" ip link set "$vn" up || return 1
+    sudo ip netns exec "$ns" ip route add default via "$gw" || return 1
 
     echo "[+] Configurando DNS..." >&2
     sudo mkdir -p "/etc/netns/$ns" || return 1
@@ -255,17 +379,17 @@ ns_start() {
     sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null || return 1
 
     echo "[+] Configurando NAT..." >&2
-    sudo iptables -t nat -C POSTROUTING -s 10.200.1.0/24 -o "$inet_iface" -j MASQUERADE 2>/dev/null || \
-    sudo iptables -t nat -A POSTROUTING -s 10.200.1.0/24 -o "$inet_iface" -j MASQUERADE || return 1
+    sudo iptables -t nat -C POSTROUTING -s "$subnet" -o "$inet_iface" -j MASQUERADE 2>/dev/null || \
+    sudo iptables -t nat -A POSTROUTING -s "$subnet" -o "$inet_iface" -j MASQUERADE || return 1
 
     echo "[+] Verificando conectividad..." >&2
     sudo ip netns exec "$ns" ping -c 1 1.1.1.1 >/dev/null 2>&1 || true
 
     if has_socat; then
         echo "[+] Iniciando ADB forwarders..." >&2
-        sudo socat TCP-LISTEN:5037,bind=10.200.1.1,fork,reuseaddr TCP:127.0.0.1:5037 >/dev/null 2>&1 &
+        sudo socat TCP-LISTEN:5037,bind="$gw",fork,reuseaddr TCP:127.0.0.1:5037 >/dev/null 2>&1 &
         echo $! | sudo tee "$(ns_socat_host_pid "$ns")" >/dev/null
-        sudo ip netns exec "$ns" socat TCP-LISTEN:5037,bind=127.0.0.1,fork,reuseaddr TCP:10.200.1.1:5037 >/dev/null 2>&1 &
+        sudo ip netns exec "$ns" socat TCP-LISTEN:5037,bind=127.0.0.1,fork,reuseaddr TCP:"$gw":5037 >/dev/null 2>&1 &
         echo $! | sudo tee "$(ns_socat_ns_pid "$ns")" >/dev/null
     fi
 
@@ -275,10 +399,10 @@ ns_start() {
         --daemon \
         --resolv-retry infinite \
         --log "$(ns_log_file "$ns")" \
-        --writepid "$(ns_pid_file "$ns")" >/dev/null 2>&1 || return 1
+        --writepid "$(ns_pid_file "$ns")" >/dev/null 2>&1 || true
 
-    echo "[+] Esperando tun0..." >&2
-    for i in {1..20}; do
+    echo "[+] Esperando tun0 (timeout ${VPN_TIMEOUT}s)..." >&2
+    for ((i=0; i<VPN_TIMEOUT; i++)); do
         if ns_vpn_connected "$ns"; then
             break
         fi
@@ -298,7 +422,7 @@ ns_start() {
         vpn_ip="offline"
     fi
 
-    save_space "$ns" "$(basename "$config")" "$vpn_ip"
+    save_space "$ns" "$(basename "$config")" "$vpn_ip" "$(ns_alloc_subnet "$ns")"
 
     echo >&2
     echo "==================================" >&2
@@ -319,8 +443,8 @@ create_new_vpn() {
         return 1
     }
 
-    ovpn_path="$VPN_DIR/$ovpn"
-    if [[ ! -f "$ovpn_path" ]]; then
+    ovpn_path=$(find_config "$ovpn") || true
+    if [[ -z "$ovpn_path" ]]; then
         ovpn_path="$ovpn"
     fi
     echo "[+] VPN seleccionada: $(basename "$ovpn_path")" >&2
@@ -614,7 +738,7 @@ open_session() {
     if [[ "$space" == "Local" ]]; then
         local cmd="opencode --session \"$sid\""
         if command -v kitty &>/dev/null; then
-            kitty @ launch --type=tab --title "opencode:${sid:0:12}" --hold \
+            kitty @ launch --type=os-window --title "opencode:${sid:0:12}" --hold \
                 bash -c "$cmd" 2>/dev/null || \
             kitty --hold bash -c "$cmd" &>/dev/null & disown
         else
@@ -635,7 +759,7 @@ new_session() {
 
     if [[ "$space" == "Local" ]]; then
         if command -v kitty &>/dev/null; then
-            kitty @ launch --type=tab --title "opencode:new" --hold \
+            kitty @ launch --type=os-window --title "opencode:new" --hold \
                 bash -c "opencode" 2>/dev/null || \
             kitty --hold bash -c "opencode" &>/dev/null & disown
         else
@@ -652,14 +776,9 @@ new_session() {
 
 # === Entry point ===
 if [[ -n "$SHOW_ALL_FORKS" ]]; then
-    cols=$(tput cols 2>/dev/null || echo "${COLUMNS:-80}")
-    fmt_tw=30
-    fmt_dw=$((cols - fmt_tw - 7 - 10 - 3 - 4))
-    if [[ $fmt_dw -lt 10 ]]; then
-        fmt_dw=10
-        fmt_tw=$((cols - fmt_dw - 7 - 10 - 3 - 4))
-        [[ $fmt_tw -lt 15 ]] && fmt_tw=15
-    fi
+    setup_widths
+    fmt_tw=$TITLE_W
+    fmt_dw=$DIR_W
 
     # Skip dedup, show all sessions (for EXPANDED view by default)
     mapfile -t lines < <(sqlite3 "$DB" "
@@ -703,7 +822,8 @@ ORDER BY COALESCE(NULLIF(o.opened.last_opened, 0), time_updated) DESC;
     if [[ "$NO_VPN" == "true" ]]; then
         space="Local"
     else
-        space=$(select_space)
+        space=$(select_space) || true
+        [[ -z "$space" ]] && exit 0
     fi
     open_session "$(cut -f1 <<< "$selected")" "$space"
     exit 0
@@ -723,7 +843,12 @@ while true; do
     l1_id=$(cut -f1 <<< "$l1_sel")
 
     if [[ "$l1_id" == "__NEW_SESSION__" ]]; then
-        if [[ "$NO_VPN" == "true" ]]; then space="Local"; else space=$(select_space); fi
+        if [[ "$NO_VPN" == "true" ]]; then
+            space="Local"
+        else
+            space=$(select_space) || true
+            [[ -z "$space" ]] && continue
+        fi
         new_session "$space"
         continue
     fi
@@ -743,7 +868,12 @@ while true; do
 
     if [[ -z "$canonical" ]] || (( fork_count <= 1 )); then
         log "no forks, opening session directly"
-        if [[ "$NO_VPN" == "true" ]]; then space="Local"; else space=$(select_space); fi
+        if [[ "$NO_VPN" == "true" ]]; then
+            space="Local"
+        else
+            space=$(select_space) || true
+            [[ -z "$space" ]] && continue
+        fi
         open_session "$l1_id" "$space"
         continue
     fi
@@ -752,7 +882,12 @@ while true; do
     l2_out=$(build_l2 "$canonical") || true
     log "l2_out='${l2_out:0:60}...'"
     [[ -z "$l2_out" ]] && continue  # Escape → back to level 1
-    if [[ "$NO_VPN" == "true" ]]; then space="Local"; else space=$(select_space); fi
+    if [[ "$NO_VPN" == "true" ]]; then
+        space="Local"
+    else
+        space=$(select_space) || true
+        [[ -z "$space" ]] && continue
+    fi
     open_session "$(cut -f1 <<< "$l2_out")" "$space"
     continue
 done
